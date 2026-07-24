@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import json
 
+# Import our optimization function and configurations
+from ml.optimizer import find_optimal_depot, CHARGING_DEPOTS
+
 app = FastAPI(title="Autonomous Fleet Optimization API")
 
 # Allow our upcoming Next.js frontend to communicate with the API without CORS blockers
@@ -15,10 +18,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # In-memory storage to keep track of the latest state of all vehicles
-# (We will eventually scale this out to a proper time-series database structure)
 active_fleet_state: Dict[str, dict] = {}
+
 
 # --- WEBSOCKET CONNECTION MANAGER ---
 class ConnectionManager:
@@ -30,17 +32,21 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
         """Send a JSON payload to every connected browser client in real time."""
-        for connection in self.active_connections:
+        # Iterate over a shallow copy to prevent modification errors during iteration
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
             except Exception:
                 # Handle dead/stale connections safely
-                self.active_connections.remove(connection)
+                if connection in self.active_connections:
+                    self.active_connections.remove(connection)
 
+# THIS IS THE MISSING LINE THAT FIXES THE RED UNDERLINES:
 manager = ConnectionManager()
 
 
@@ -67,12 +73,27 @@ async def receive_telemetry(payload: TelemetryPayload):
     """
     data = payload.model_dump()
     
-    # Store the latest update in our state map
-    active_fleet_state[payload.vehicle_id] = data
+    # --- OPTIMIZATION LOGIC ---
+    # If the vehicle is low on battery and hasn't been assigned a station yet, compute the best one!
+    if data["status"] == "LOW_BATTERY" and not data["assigned_depot_id"]:
+        optimal_depot = find_optimal_depot(data["lat"], data["lng"], active_fleet_state)
+        
+        if optimal_depot:
+            data["assigned_depot_id"] = optimal_depot["id"]
+            data["status"] = "EN_ROUTE_TO_CHARGE"
+            print(f"🤖 [OPTIMIZER] Routed {data['vehicle_id']} to {optimal_depot['id']} due to optimal resource cost.")
     
-    # Broadcast the data downstream to the frontend dashboard
+    # Save state and broadcast over WebSockets
+    active_fleet_state[payload.vehicle_id] = data
     await manager.broadcast({"type": "VEHICLE_UPDATE", "data": data})
-    return {"success": True}
+    
+    # Return the data state back to the simulator so the vehicle knows its new destination targets
+    return {
+        "success": True, 
+        "assigned_depot_id": data["assigned_depot_id"],
+        "status": data["status"],
+        "depots": CHARGING_DEPOTS
+    }
 
 @app.get("/api/fleet")
 def get_current_fleet():
@@ -91,7 +112,6 @@ async def websocket_endpoint(websocket: WebSocket):
         
         while True:
             # Keep the connection alive; listen for any client-side commands
-            data = await websocket.receive_text()
-            # Future expansion: Handle manual supervisor override commands here
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
