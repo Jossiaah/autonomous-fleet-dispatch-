@@ -91,7 +91,19 @@ class AutonomousVehicle:
             }
 
             # Fire callback function to broadcast this payload to the pipeline
-            await on_telemetry_tick(telemetry)
+            response_data = await on_telemetry_tick(telemetry)
             
+            # If the backend changed our status or assigned us a depot, absorb those configurations
+            if response_data and response_data.get("assigned_depot_id"):
+                if self.status == "LOW_BATTERY" or self.status == "DRIVING":
+                    depot_id = response_data["assigned_depot_id"]
+                    depot_info = response_data["depots"][depot_id]
+                    
+                    # Intercept current route, target the charging dock station coordinates
+                    self.assigned_depot_id = depot_id
+                    self.target_lat = depot_info["lat"]
+                    self.target_lng = depot_info["lng"]
+                    self.status = response_data["status"] # Will update to "EN_ROUTE_TO_CHARGE"
+
             # Wait for next clock tick
-            await asyncio.sleep(1)
+            await asyncio.sleep(1)a
